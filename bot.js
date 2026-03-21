@@ -11,10 +11,6 @@ redis.on("connect", () => console.log("Redis conectado"));
 redis.on("error",   (e) => console.error("Redis error:", e.message));
 
 const SESSION_TTL = 60 * 60 * 24;
-redis.on("connect", () => console.log("✅ Redis conectado correctamente"));
-redis.on("error",   (e) => console.error("❌ Redis error:", e.message));
-
-const SESSION_TTL = 60 * 60 * 24;
 
 /* ======================================================
    HELPERS DE FECHA
