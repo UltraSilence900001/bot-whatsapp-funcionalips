@@ -1,367 +1,636 @@
-const axios = require("axios");
+const axios  = require("axios");
+const Redis  = require("ioredis");
 
 /* ======== CONFIGURACION ======== */
-const TOKEN = process.env.ACCESS_TOKEN;
+const TOKEN    = process.env.ACCESS_TOKEN;
 const PHONE_ID = process.env.PHONE_ID;
 
-/* ======== ESTADO DE SESION POR USUARIO ======== */
-const sesiones = {};
+/* ======== REDIS ======== */
+const redis = new Redis(process.env.REDIS_URL || "redis://127.0.0.1:6379");
+redis.on("connect", () => console.log("Redis conectado"));
+redis.on("error",   (e) => console.error("Redis error:", e.message));
 
-/* ======== ENVIAR MENSAJE ======== */
-async function sendMessage(to, text) {
+const SESSION_TTL = 60 * 60 * 24;
+redis.on("connect", () => console.log("✅ Redis conectado correctamente"));
+redis.on("error",   (e) => console.error("❌ Redis error:", e.message));
+
+const SESSION_TTL = 60 * 60 * 24;
+
+/* ======================================================
+   HELPERS DE FECHA
+   ====================================================== */
+function fechaKey(d = new Date()) { return d.toISOString().slice(0,10); }
+function semanaKey(d = new Date()) {
+  const x = new Date(d), day = x.getDay()||7;
+  x.setDate(x.getDate()-day+1);
+  return `${x.getFullYear()}-W${String(Math.ceil(x.getDate()/7)).padStart(2,"0")}`;
+}
+function mesKey(d = new Date()) { return d.toISOString().slice(0,7); }
+
+/* ======================================================
+   SESIONES
+   ====================================================== */
+async function getSession(from) {
+  const data = await redis.get(`session:${from}`);
+  return data ? JSON.parse(data) : { paso:"inicio", datos:{} };
+}
+async function saveSession(from, sesion) {
+  await redis.set(`session:${from}`, JSON.stringify(sesion), "EX", SESSION_TTL);
+}
+async function clearSession(from) { await redis.del(`session:${from}`); }
+
+/* ======================================================
+   MÉTRICAS
+   ====================================================== */
+async function trackConversacion(from) {
+  const hoy = fechaKey();
+  await redis.sadd("usuarios:unicos", from);
+  await redis.sadd(`conv:dia:${hoy}`, from);
+  await redis.sadd(`conv:semana:${semanaKey()}`, from);
+  await redis.sadd(`conv:mes:${mesKey()}`, from);
+  const key = `usuario:${from}`;
+  if (!await redis.exists(key)) await redis.hset(key, { phone:from, primeraConv:new Date().toISOString(), citas:0 });
+  await redis.hset(key, "ultimaConv", new Date().toISOString());
+}
+async function trackCita(cita) {
+  const hoy = fechaKey();
+  await redis.incr(`citas:count:dia:${hoy}`);
+  await redis.incr(`citas:count:semana:${semanaKey()}`);
+  await redis.incr(`citas:count:mes:${mesKey()}`);
+  await redis.incr(`citas:especialidad:${cita.especialidad}`);
+  await redis.sadd("usuarios:con:cita", cita.phone);
+  const prev = parseInt(await redis.hget(`usuario:${cita.phone}`,"citas")||0);
+  await redis.hset(`usuario:${cita.phone}`, "citas", prev+1, "nombre", cita.nombre);
+}
+
+/* ======================================================
+   GUARDAR CITA EN REDIS
+   ====================================================== */
+async function guardarCitaRedis(cita) {
+  const id = `cita:${cita.phone}:${Date.now()}`;
+  await redis.set(id, JSON.stringify({...cita, id, creadaEn:new Date().toISOString()}), "EX", 60*60*24*30);
+  await redis.sadd("citas:activas", id);
+  await trackCita(cita);
+  console.log("📅 Cita guardada en Redis:", id);
+  return id;
+}
+
+/* ======================================================
+   FUNCIONES DE ENVIO
+   ====================================================== */
+async function sendText(to, body) {
   try {
-    await axios.post(
-      `https://graph.facebook.com/v18.0/${PHONE_ID}/messages`,
+    await axios.post(`https://graph.facebook.com/v18.0/${PHONE_ID}/messages`,
+      { messaging_product:"whatsapp", to, type:"text", text:{ body, preview_url:false } },
+      { headers:{ Authorization:`Bearer ${TOKEN}`, "Content-Type":"application/json" } }
+    );
+    console.log("✅ Texto →", to);
+  } catch(e) { console.log("❌ Error texto:", e.response?.data||e.message); }
+}
+
+async function sendButtons(to, { header, body, footer, buttons }) {
+  try {
+    await axios.post(`https://graph.facebook.com/v18.0/${PHONE_ID}/messages`,
       {
-        messaging_product: "whatsapp",
-        to: to,
-        text: { body: text }
-      },
-      {
-        headers: {
-          Authorization: `Bearer ${TOKEN}`,
-          "Content-Type": "application/json"
+        messaging_product:"whatsapp", to, type:"interactive",
+        interactive:{
+          type:"button",
+          ...(header && { header:{ type:"text", text:header } }),
+          body:{ text:body },
+          ...(footer && { footer:{ text:footer } }),
+          action:{ buttons:buttons.map(b=>({ type:"reply", reply:{ id:b.id, title:b.title } })) }
         }
+      },
+      { headers:{ Authorization:`Bearer ${TOKEN}`, "Content-Type":"application/json" } }
+    );
+    console.log("✅ Botones →", to);
+  } catch(e) { console.log("❌ Error botones:", e.response?.data||e.message); }
+}
+
+async function sendList(to, { header, body, footer, buttonLabel, sections }) {
+  try {
+    await axios.post(`https://graph.facebook.com/v18.0/${PHONE_ID}/messages`,
+      {
+        messaging_product:"whatsapp", to, type:"interactive",
+        interactive:{
+          type:"list",
+          ...(header && { header:{ type:"text", text:header } }),
+          body:{ text:body },
+          ...(footer && { footer:{ text:footer } }),
+          action:{ button:buttonLabel||"Ver opciones", sections }
+        }
+      },
+      { headers:{ Authorization:`Bearer ${TOKEN}`, "Content-Type":"application/json" } }
+    );
+    console.log("✅ Lista →", to);
+  } catch(e) { console.log("❌ Error lista:", e.response?.data||e.message); }
+}
+
+/* ======================================================
+   MENUS REUTILIZABLES
+   ====================================================== */
+async function enviarMenuPrincipal(to) {
+  await sendButtons(to, {
+    header:"🏥 IPS Salud Vida",
+    body:"¡Bienvenido! ¿En qué podemos ayudarte hoy?",
+    footer:"Selecciona una opción para continuar",
+    buttons:[
+      { id:"menu_cita",     title:"📅 Agendar cita" },
+      { id:"menu_horarios", title:"🕐 Horarios"      },
+      { id:"menu_sedes",    title:"📍 Sedes"         }
+    ]
+  });
+  await sendButtons(to, {
+    body:"¿Necesitas hablar con alguien?",
+    buttons:[{ id:"menu_asesor", title:"👨‍💼 Hablar con asesor" }]
+  });
+}
+
+async function enviarMenuEspecialidades(to) {
+  await sendList(to, {
+    header:"📅 Agendar Cita", body:"Selecciona el tipo de servicio:",
+    footer:"IPS Salud Vida", buttonLabel:"Ver servicios",
+    sections:[{ title:"Servicios disponibles", rows:[
+      { id:"esp_medicina",     title:"🩺 Medicina General" },
+      { id:"esp_odonto",       title:"🦷 Odontología"      },
+      { id:"esp_psicologia",   title:"🧠 Psicología"       },
+      { id:"esp_nutricion",    title:"🥗 Nutrición"        },
+      { id:"esp_especialista", title:"👨‍⚕️ Especialistas"  }
+    ]}]
+  });
+}
+
+async function enviarMenuEPS(to, especialidad) {
+  await sendList(to, {
+    header:`🩺 ${especialidad}`, body:"¿Con qué EPS estás afiliado?",
+    footer:"IPS Salud Vida", buttonLabel:"Seleccionar EPS",
+    sections:[{ title:"EPS / Aseguradora", rows:[
+      { id:"eps_sura",       title:"Sura"                 },
+      { id:"eps_sanitas",    title:"Sanitas"              },
+      { id:"eps_nueva",      title:"Nueva EPS"            },
+      { id:"eps_coosalud",   title:"Coosalud"             },
+      { id:"eps_particular", title:"Particular (sin EPS)" },
+      { id:"eps_otra",       title:"Otra"                 }
+    ]}]
+  });
+}
+
+/* ── Menú de sedes para elegir antes de ver fechas ── */
+async function enviarMenuSedesCita(to) {
+  await sendButtons(to, {
+    header:"📍 ¿En qué sede prefieres tu cita?",
+    body:"Selecciona la sede para ver disponibilidad en tiempo real:",
+    footer:"Mostramos solo horarios disponibles",
+    buttons:[
+      { id:"sede_cita_centro", title:"🏢 Sede Centro" },
+      { id:"sede_cita_norte",  title:"🏢 Sede Norte"  },
+      { id:"sede_cita_sur",    title:"🏢 Sede Sur"    }
+    ]
+  });
+}
+
+/* ── Enviar slots reales de Google Calendar ── */
+async function enviarSlotsFechas(to, sede, especialidad) {
+  const { obtenerSlotsConCache } = require("./calendar");
+
+  await sendText(to, `🔍 Consultando disponibilidad en *${sede}*...\nEspera un momento ⏳`);
+
+  const slots = await obtenerSlotsConCache(sede);
+
+  if (!slots || slots.length === 0) {
+    await sendText(to,
+      `😔 No hay disponibilidad en *${sede}* para los próximos días.\n\n` +
+      `¿Deseas consultar en otra sede?`
+    );
+    await enviarMenuSedesCita(to);
+    return false;
+  }
+
+  // Tomar máximo 8 slots y construir la lista
+  const rows = slots.slice(0, 8).map((slot, i) => ({
+    id:          `slot_${i}`,
+    title:       slot.label,
+    description: sede
+  }));
+
+  // Guardar los slots en sesión temporalmente para recuperarlos al seleccionar
+  await redis.set(`slots:seleccion:${to}`, JSON.stringify(slots.slice(0,8)), "EX", 60*15);
+
+  await sendList(to, {
+    header:`📅 Disponibilidad — ${sede}`,
+    body:`Selecciona tu horario para *${especialidad}*:`,
+    footer:"Solo se muestran horarios disponibles en tiempo real",
+    buttonLabel:"Ver horarios",
+    sections:[{ title:`Próximos horarios libres`, rows }]
+  });
+
+  return true;
+}
+
+async function enviarMenuSedes(to) {
+  await sendButtons(to, {
+    header:"📍 Nuestras Sedes", body:"¿Qué sede deseas consultar?",
+    buttons:[
+      { id:"sede_centro", title:"🏢 Sede Centro" },
+      { id:"sede_norte",  title:"🏢 Sede Norte"  },
+      { id:"sede_sur",    title:"🏢 Sede Sur"    }
+    ]
+  });
+}
+
+/* ======================================================
+   NOTIFICAR A ASESORES
+   ====================================================== */
+async function notificarAsesores(phoneUsuario, nombre, motivo) {
+  const { ASESORES, getAsesorDisponible, asignarAsesor, agregarACola } = require("./asesor");
+  const asesorLibre = await getAsesorDisponible();
+
+  if (asesorLibre) {
+    await asignarAsesor(phoneUsuario, asesorLibre.phone);
+    let infoCita = null;
+    const keys = await redis.smembers("citas:activas");
+    for (const key of keys) {
+      if (key.includes(phoneUsuario)) {
+        const data = await redis.get(key);
+        if (data) infoCita = JSON.parse(data);
       }
-    );
-    console.log("✅ Mensaje enviado a:", to);
-  } catch (error) {
-    console.log(
-      "❌ Error enviando mensaje:",
-      error.response?.data || error.message
-    );
+    }
+    let msgAsesor =
+      `🔔 *Nueva consulta asignada*\n\n👤 ${nombre||phoneUsuario}\n📱 +${phoneUsuario}\n💬 ${motivo}\n`;
+    if (infoCita) {
+      msgAsesor += `\n📋 *Cita:*\n🏥 ${infoCita.especialidad} | 🏦 ${infoCita.eps}\n📅 ${infoCita.label}\n📍 ${infoCita.sede}\n`;
+    }
+    msgAsesor += `\n─────────────────\n💡 *Comandos:*\nEscribe para responder.\n*#fin* — terminar\n*#info* — datos usuario\n*#cola* — usuarios en espera\n─────────────────`;
+    await sendText(asesorLibre.phone, msgAsesor);
+    return { asignado: true, asesor: asesorLibre };
+  } else {
+    const posicion = await agregarACola(phoneUsuario, motivo, nombre);
+    for (const [phone] of Object.entries(ASESORES)) {
+      await sendText(phone, `⚠️ *Usuario en espera #${posicion}*\n👤 ${nombre||phoneUsuario}\n💬 ${motivo}\n\n*#siguiente* para atenderlo.`);
+    }
+    return { asignado: false, posicion };
   }
 }
 
-/* ======== MENU PRINCIPAL ======== */
-function menuPrincipal() {
-  return `👋 ¡Bienvenido a *IPS Salud Vida*!
-Estamos aquí para ayudarte. ¿En qué podemos asistirte hoy?
+/* ======================================================
+   MANEJAR MENSAJES DE ASESORES
+   ====================================================== */
+async function manejarMensajeAsesor(phoneAsesor, texto) {
+  const { getUsuarioDeAsesor, finalizarAtencion, siguienteEnCola, asignarAsesor, tamañoCola, ASESORES } = require("./asesor");
+  const cmd = texto?.trim().toLowerCase();
+  const phoneUsuario = await getUsuarioDeAsesor(phoneAsesor);
+  const asesorInfo   = ASESORES[phoneAsesor];
 
-1️⃣ Agendar cita
-2️⃣ Horarios
-3️⃣ Sedes
-4️⃣ Hablar con un asesor`;
+  if (cmd === "#fin") {
+    if (!phoneUsuario) { await sendText(phoneAsesor,"ℹ️ No tienes usuarios asignados."); return; }
+    await sendText(phoneUsuario, `✅ *Atención finalizada.*\nGracias por contactar a *IPS Salud Vida*. ¡Que tengas un excelente día! 💚`);
+    await sendButtons(phoneUsuario, { body:"¿Algo más en lo que podamos ayudarte?", buttons:[
+      { id:"menu_cita", title:"📅 Agendar cita" }, { id:"menu_principal", title:"🏠 Menú principal" }
+    ]});
+    await saveSession(phoneUsuario, { paso:"menu", datos:{} });
+    await finalizarAtencion(phoneUsuario, phoneAsesor);
+    await sendText(phoneAsesor, `✅ Atención finalizada con *+${phoneUsuario}*. Bot reactivado.`);
+    const siguiente = await siguienteEnCola();
+    if (siguiente) {
+      await asignarAsesor(siguiente.phone, phoneAsesor);
+      await sendText(phoneAsesor, `🔔 *Siguiente:*\n👤 ${siguiente.nombre||siguiente.phone}\n📱 +${siguiente.phone}\n💬 ${siguiente.motivo}\n\n*#fin* para terminar.`);
+      await sendText(siguiente.phone, `✅ *¡Asesor disponible!*\n👨‍💼 *${asesorInfo.nombre}* te atenderá ahora. 💬`);
+    } else {
+      await sendText(phoneAsesor, "ℹ️ No hay más usuarios en cola. 🎉");
+    }
+    return;
+  }
+  if (cmd === "#siguiente") {
+    if (phoneUsuario) { await sendText(phoneAsesor,`⚠️ Aún tienes activo +${phoneUsuario}. Escribe *#fin* primero.`); return; }
+    const siguiente = await siguienteEnCola();
+    if (siguiente) {
+      await asignarAsesor(siguiente.phone, phoneAsesor);
+      await sendText(phoneAsesor, `✅ *Nuevo usuario:*\n👤 ${siguiente.nombre||siguiente.phone}\n📱 +${siguiente.phone}\n💬 ${siguiente.motivo}`);
+      await sendText(siguiente.phone, `✅ *¡Asesor disponible!*\n👨‍💼 *${asesorInfo.nombre}* te atenderá ahora. 💬`);
+    } else { await sendText(phoneAsesor,"ℹ️ No hay usuarios en cola."); }
+    return;
+  }
+  if (cmd === "#info") {
+    if (!phoneUsuario) { await sendText(phoneAsesor,"ℹ️ No tienes usuarios asignados."); return; }
+    const datos = await redis.hgetall(`usuario:${phoneUsuario}`);
+    let infoCita = null;
+    const keys = await redis.smembers("citas:activas");
+    for (const key of keys) {
+      if (key.includes(phoneUsuario)) { const d = await redis.get(key); if (d) infoCita = JSON.parse(d); }
+    }
+    let msg = `📋 *+${phoneUsuario}*\n👤 ${datos?.nombre||"—"}\n💬 Citas: ${datos?.citas||0}`;
+    if (infoCita) msg += `\n\n✅ *Cita:*\n🏥 ${infoCita.especialidad} | ${infoCita.eps}\n📅 ${infoCita.label}\n📍 ${infoCita.sede}`;
+    await sendText(phoneAsesor, msg); return;
+  }
+  if (cmd === "#cola") {
+    const c = await tamañoCola();
+    await sendText(phoneAsesor, `📊 Usuarios en cola: *${c}*`); return;
+  }
+  if (!phoneUsuario) {
+    await sendText(phoneAsesor,`ℹ️ Sin usuarios asignados.\n*#siguiente* — tomar siguiente\n*#cola* — ver cola`); return;
+  }
+  await sendText(phoneUsuario, `👨‍💼 *${asesorInfo.nombre}:*\n\n${texto}`);
+  console.log(`📨 Asesor ${phoneAsesor} → Usuario ${phoneUsuario}`);
 }
 
-/* ======== LOGICA DEL BOT ======== */
-async function handleBot(from, text) {
-  const msg = text?.trim().toLowerCase();
+/* ======================================================
+   LOGICA PRINCIPAL DEL BOT
+   ====================================================== */
+async function handleBot(from, text, buttonId) {
+  const { esAsesor, getAsesorDeUsuario } = require("./asesor");
+  const { crearEvento, cancelarEvento, invalidarCache } = require("./calendar");
 
-  if (!sesiones[from]) {
-    sesiones[from] = { paso: "inicio", datos: {} };
-  }
+  const msg     = text?.trim().toLowerCase() || "";
+  const payload = buttonId || msg;
 
-  const sesion = sesiones[from];
-  let response = "";
+  /* ── ¿Es asesor? ── */
+  if (esAsesor(from)) { await manejarMensajeAsesor(from, text); return; }
 
-  /* ── REINICIO ── */
-  if (msg === "hola" || msg === "menu" || msg === "menú" || msg === "inicio") {
-    sesiones[from] = { paso: "menu", datos: {} };
-    await sendMessage(from, menuPrincipal());
+  await trackConversacion(from);
+
+  /* ── ¿Está con asesor? ── */
+  const phoneAsesor = await getAsesorDeUsuario(from);
+  if (phoneAsesor) {
+    const nombre = await redis.hget(`usuario:${from}`,"nombre") || from;
+    await sendText(phoneAsesor, `💬 *${nombre} (+${from}):*\n\n${text||"(tocó un botón)"}`);
     return;
   }
 
-  /* ── MENU PRINCIPAL ── */
+  const sesion = await getSession(from);
+
+  /* ── Reinicio ── */
+  if (["hola","menu","menú","inicio","start"].includes(msg) || payload === "menu_principal") {
+    await clearSession(from);
+    await saveSession(from, { paso:"menu", datos:{} });
+    await enviarMenuPrincipal(from); return;
+  }
+
+  /* ── Confirmar / cancelar cita ── */
+  if (payload === "cita_confirmar") {
+    await sendText(from,`✅ *¡Cita confirmada!*\nTe esperamos. Llega 10 minutos antes. 😊`);
+    await saveSession(from, sesion); return;
+  }
+  if (payload === "cita_cancelar") {
+    const keys = await redis.smembers("citas:activas");
+    for (const key of keys) {
+      if (key.includes(from)) {
+        const data = await redis.get(key);
+        if (data) {
+          const cita = JSON.parse(data);
+          // Cancelar también en Google Calendar
+          if (cita.googleEventId) await cancelarEvento(cita.googleEventId);
+          if (cita.sede) await invalidarCache(cita.sede);
+        }
+        await redis.del(key); await redis.srem("citas:activas", key);
+      }
+    }
+    await sendText(from,`❌ *Cita cancelada.*\nSi deseas reagendar, estamos aquí. 🙏`);
+    await sendButtons(from, { body:"¿Deseas agendar una nueva cita?", buttons:[
+      { id:"menu_cita", title:"📅 Agendar cita" }, { id:"menu_principal", title:"🏠 Menú principal" }
+    ]});
+    await saveSession(from,{ paso:"menu", datos:{} }); return;
+  }
+
+  /* ── Menú principal ── */
   if (sesion.paso === "inicio" || sesion.paso === "menu") {
-    sesiones[from] = { paso: "menu", datos: {} };
-
-    if (msg === "1") {
+    sesion.paso = "menu";
+    if (payload === "menu_cita") {
       sesion.paso = "cita_especialidad";
-      response = `Perfecto, vamos a agendar tu cita 📅
-Por favor, selecciona el tipo de servicio:
-
-1️⃣ Medicina general
-2️⃣ Odontología
-3️⃣ Psicología
-4️⃣ Nutrición
-5️⃣ Especialistas
-🔙 Escribe *menu* para volver`;
-
-    } else if (msg === "2") {
-      response = `🕐 *Horarios de atención por sede:*
-
-🏢 *Sede Centro*
-Lunes a viernes: 7:00 AM – 6:00 PM
-Sábados: 8:00 AM – 1:00 PM
-
-🏢 *Sede Norte*
-Lunes a viernes: 7:00 AM – 5:00 PM
-Sábados: 8:00 AM – 12:00 PM
-
-🏢 *Sede Sur*
-Lunes a viernes: 8:00 AM – 6:00 PM
-Sábados: 9:00 AM – 1:00 PM
-
-⚠️ Los domingos y festivos no hay atención presencial.
-Para urgencias llama al 📞 018000-000000
-
-¿Deseas algo más?
-1️⃣ Agendar una cita
-3️⃣ Ver sedes
-🔙 Escribe *menu* para volver`;
-
-    } else if (msg === "3") {
-      sesion.paso = "sedes";
-      response = `📍 *Nuestras sedes disponibles:*
-
-1️⃣ Sede Centro
-2️⃣ Sede Norte
-3️⃣ Sede Sur
-🔙 Escribe *menu* para volver`;
-
-    } else if (msg === "4") {
-      sesion.paso = "asesor_motivo";
-      response = `👨‍💼 Con gusto te conectamos con un asesor.
-
-Por favor cuéntanos: ¿*Cuál es el motivo de tu consulta?*
-(Escribe tu mensaje y te responderemos a la brevedad)`;
-
+      await saveSession(from, sesion); await enviarMenuEspecialidades(from);
+    } else if (payload === "menu_horarios") {
+      await saveSession(from, sesion);
+      await sendText(from,
+        `🕐 *Horarios de atención:*\n\n🏢 *Sede Centro*\nLun–Vie: 7:00 AM – 6:00 PM\nSáb: 8:00 AM – 1:00 PM\n\n` +
+        `🏢 *Sede Norte*\nLun–Vie: 7:00 AM – 5:00 PM\nSáb: 8:00 AM – 12:00 PM\n\n` +
+        `🏢 *Sede Sur*\nLun–Vie: 8:00 AM – 6:00 PM\nSáb: 9:00 AM – 1:00 PM\n\n` +
+        `⚠️ Domingos y festivos sin atención.\n📞 Urgencias: 018000-000000`
+      );
+      await sendButtons(from, { body:"¿Deseas hacer algo más?", buttons:[
+        { id:"menu_cita", title:"📅 Agendar cita" }, { id:"menu_sedes", title:"📍 Ver sedes" }, { id:"menu_principal", title:"🏠 Menú principal" }
+      ]});
+    } else if (payload === "menu_sedes") {
+      sesion.paso = "sedes"; await saveSession(from, sesion); await enviarMenuSedes(from);
+    } else if (payload === "menu_asesor") {
+      sesion.paso = "asesor_motivo"; await saveSession(from, sesion);
+      await sendText(from,`👨‍💼 Con gusto te conectamos con un asesor.\n\n¿*Cuál es el motivo de tu consulta?*\n_(Escribe tu mensaje)_`);
     } else {
-      response = `😅 No entendí tu mensaje.
-Por favor selecciona una opción válida o escribe *menu* para ver el menú principal.
-
-${menuPrincipal()}`;
+      await saveSession(from, sesion); await enviarMenuPrincipal(from);
     }
-
-    await sendMessage(from, response);
     return;
   }
 
-  /* ── FLUJO: AGENDAR CITA ── */
+  /* ── Especialidad ── */
   if (sesion.paso === "cita_especialidad") {
-    const especialidades = {
-      "1": "Medicina General",
-      "2": "Odontología",
-      "3": "Psicología",
-      "4": "Nutrición",
-      "5": "Especialistas"
-    };
-
-    if (especialidades[msg]) {
-      sesion.datos.especialidad = especialidades[msg];
-      sesion.paso = "cita_eps";
-      response = `Has seleccionado *${sesion.datos.especialidad}* 🩺
-¿Con qué EPS o aseguradora estás afiliado?
-
-1️⃣ Sura
-2️⃣ Sanitas
-3️⃣ Nueva EPS
-4️⃣ Coosalud
-5️⃣ Particular (sin EPS)
-6️⃣ Otra
-🔙 Escribe *menu* para volver`;
+    const esp = { esp_medicina:"Medicina General", esp_odonto:"Odontología", esp_psicologia:"Psicología", esp_nutricion:"Nutrición", esp_especialista:"Especialistas" };
+    if (esp[payload]) {
+      sesion.datos.especialidad = esp[payload]; sesion.paso = "cita_eps";
+      await saveSession(from, sesion); await enviarMenuEPS(from, sesion.datos.especialidad);
     } else {
-      response = `Por favor selecciona una opción válida:
-
-1️⃣ Medicina general
-2️⃣ Odontología
-3️⃣ Psicología
-4️⃣ Nutrición
-5️⃣ Especialistas
-🔙 Escribe *menu* para volver`;
+      await saveSession(from, sesion); await sendText(from,"Por favor selecciona una especialidad 👆"); await enviarMenuEspecialidades(from);
     }
-
-    await sendMessage(from, response);
     return;
   }
 
+  /* ── EPS ── */
   if (sesion.paso === "cita_eps") {
-    const eps = {
-      "1": "Sura",
-      "2": "Sanitas",
-      "3": "Nueva EPS",
-      "4": "Coosalud",
-      "5": "Particular",
-      "6": "Otra"
-    };
-
-    if (eps[msg]) {
-      sesion.datos.eps = eps[msg];
-      sesion.paso = "cita_documento";
-      response = `Gracias. Ahora necesitamos algunos datos para continuar 📋
-
-Por favor escribe tu *número de documento de identidad:*`;
+    const eps = { eps_sura:"Sura", eps_sanitas:"Sanitas", eps_nueva:"Nueva EPS", eps_coosalud:"Coosalud", eps_particular:"Particular", eps_otra:"Otra" };
+    if (eps[payload]) {
+      sesion.datos.eps = eps[payload]; sesion.paso = "cita_documento";
+      await saveSession(from, sesion); await sendText(from,`✅ EPS: *${sesion.datos.eps}*\n\nEscribe tu *número de documento:*`);
     } else {
-      response = `Por favor selecciona una opción válida (1 al 6) o escribe *menu* para volver.`;
+      await saveSession(from, sesion); await sendText(from,"Por favor selecciona tu EPS 👆"); await enviarMenuEPS(from, sesion.datos.especialidad);
     }
-
-    await sendMessage(from, response);
     return;
   }
 
+  /* ── Documento ── */
   if (sesion.paso === "cita_documento") {
-    if (msg && msg.length >= 6 && !isNaN(text.trim())) {
-      sesion.datos.documento = text.trim();
-      sesion.paso = "cita_nombre";
-      response = `✅ Documento recibido.
-Ahora escribe tu *nombre completo:*`;
+    if (text && text.trim().length >= 6 && !isNaN(text.trim())) {
+      sesion.datos.documento = text.trim(); sesion.paso = "cita_nombre";
+      await saveSession(from, sesion); await sendText(from,`✅ Documento recibido.\n\nEscribe tu *nombre completo:*`);
     } else {
-      response = `Por favor escribe un número de documento válido (solo números, mínimo 6 dígitos).`;
+      await saveSession(from, sesion); await sendText(from,"⚠️ Documento inválido (solo números, mínimo 6 dígitos).");
     }
-
-    await sendMessage(from, response);
     return;
   }
 
+  /* ── Nombre ── */
   if (sesion.paso === "cita_nombre") {
-    if (text.trim().length >= 3) {
-      sesion.datos.nombre = text.trim();
-      sesion.paso = "cita_celular";
-      response = `Gracias, *${sesion.datos.nombre}*. 😊
-¿Cuál es tu *número de celular* para confirmar la cita?`;
+    if (text && text.trim().length >= 3) {
+      sesion.datos.nombre = text.trim(); sesion.paso = "cita_celular";
+      await saveSession(from, sesion); await sendText(from,`Gracias, *${sesion.datos.nombre}*. 😊\n\n¿Tu *número de celular*?`);
     } else {
-      response = `Por favor escribe tu nombre completo.`;
+      await saveSession(from, sesion); await sendText(from,"⚠️ Escribe tu nombre completo.");
     }
-
-    await sendMessage(from, response);
     return;
   }
 
+  /* ── Celular ── */
   if (sesion.paso === "cita_celular") {
-    if (text.trim().length >= 7) {
-      sesion.datos.celular = text.trim();
+    if (text && text.trim().length >= 7) {
+      sesion.datos.celular = text.trim(); sesion.paso = "cita_sede";
+      await saveSession(from, sesion);
+      // Ahora preguntar sede para consultar disponibilidad real
+      await enviarMenuSedesCita(from);
+    } else {
+      await saveSession(from, sesion); await sendText(from,"⚠️ Número de celular inválido.");
+    }
+    return;
+  }
+
+  /* ── Selección de sede para cita ── */
+  if (sesion.paso === "cita_sede") {
+    const sedeMap = {
+      sede_cita_centro: "Sede Centro",
+      sede_cita_norte:  "Sede Norte",
+      sede_cita_sur:    "Sede Sur"
+    };
+    if (sedeMap[payload]) {
+      sesion.datos.sedeCita = sedeMap[payload];
       sesion.paso = "cita_fecha";
-      response = `Perfecto. Estas son las *fechas disponibles* para tu cita de ${sesion.datos.especialidad}:
-
-1️⃣ Lunes 17 de marzo — 8:00 AM
-2️⃣ Lunes 17 de marzo — 10:30 AM
-3️⃣ Martes 18 de marzo — 2:00 PM
-4️⃣ Miércoles 19 de marzo — 9:00 AM
-🔙 Escribe *menu* para volver`;
+      await saveSession(from, sesion);
+      // Consultar Google Calendar y mostrar slots reales
+      await enviarSlotsFechas(from, sesion.datos.sedeCita, sesion.datos.especialidad);
     } else {
-      response = `Por favor escribe un número de celular válido.`;
+      await saveSession(from, sesion); await sendText(from,"Por favor selecciona una sede 👆"); await enviarMenuSedesCita(from);
     }
-
-    await sendMessage(from, response);
     return;
   }
 
+  /* ── Selección de fecha/slot real ── */
   if (sesion.paso === "cita_fecha") {
-    const fechas = {
-      "1": "Lunes 17 de marzo — 8:00 AM",
-      "2": "Lunes 17 de marzo — 10:30 AM",
-      "3": "Martes 18 de marzo — 2:00 PM",
-      "4": "Miércoles 19 de marzo — 9:00 AM"
-    };
+    // Los slots tienen ID slot_0, slot_1, etc.
+    const slotMatch = payload.match(/^slot_(\d+)$/);
 
-    if (fechas[msg]) {
-      sesion.datos.fecha = fechas[msg];
-      sesion.paso = "menu";
+    if (slotMatch) {
+      const idx  = parseInt(slotMatch[1]);
+      const slotsData = await redis.get(`slots:seleccion:${from}`);
 
-      response = `🎉 *¡Tu cita ha sido agendada con éxito!*
+      if (!slotsData) {
+        await sendText(from,"⚠️ Los horarios expiraron. Volvemos a consultar...");
+        await enviarSlotsFechas(from, sesion.datos.sedeCita, sesion.datos.especialidad);
+        return;
+      }
 
-📋 *Resumen de tu cita:*
-👤 Paciente: ${sesion.datos.nombre}
-🏥 Servicio: ${sesion.datos.especialidad}
-🏦 EPS: ${sesion.datos.eps}
-📅 Fecha: ${sesion.datos.fecha}
-📍 Sede: Centro — Calle 10 #5-32
+      const slots = JSON.parse(slotsData);
+      const slot  = slots[idx];
 
-Recibirás un recordatorio 24 horas antes por este mismo medio. ✅
+      if (!slot) {
+        await sendText(from,"Por favor selecciona un horario de la lista 👆");
+        await enviarSlotsFechas(from, sesion.datos.sedeCita, sesion.datos.especialidad);
+        return;
+      }
 
-¿Deseas hacer algo más?
-1️⃣ Agendar otra cita
-🔙 Escribe *menu* para volver al inicio`;
+      // Crear evento en Google Calendar
+      await sendText(from,"⏳ Confirmando tu cita...");
 
-      sesion.datos = {};
+      const googleEventId = await crearEvento({
+        phone:        from,
+        nombre:       sesion.datos.nombre,
+        documento:    sesion.datos.documento,
+        especialidad: sesion.datos.especialidad,
+        eps:          sesion.datos.eps,
+        sede:         slot.sede,
+        fechaInicio:  slot.inicio,
+        fechaFin:     slot.fin
+      });
+
+      // Invalidar caché para que otros usuarios vean el slot como ocupado
+      await invalidarCache(slot.sede);
+
+      // Guardar en Redis
+      await guardarCitaRedis({
+        phone:          from,
+        nombre:         sesion.datos.nombre,
+        documento:      sesion.datos.documento,
+        especialidad:   sesion.datos.especialidad,
+        eps:            sesion.datos.eps,
+        sede:           slot.sede,
+        label:          slot.label,
+        fechaISO:       slot.inicio,
+        googleEventId,
+        recordatorio24: false,
+        recordatorio2:  false
+      });
+
+      await sendText(from,
+        `🎉 *¡Cita agendada con éxito!*\n\n` +
+        `👤 ${sesion.datos.nombre}\n🪪 ${sesion.datos.documento}\n` +
+        `🏥 ${sesion.datos.especialidad} | 🏦 ${sesion.datos.eps}\n` +
+        `📅 ${slot.label}\n📍 ${slot.sede}\n\n` +
+        `📆 Evento guardado en nuestro calendario.\n` +
+        `Recibirás recordatorio 24h y 2h antes. ✅`
+      );
+
+      // Limpiar selección temporal
+      await redis.del(`slots:seleccion:${from}`);
+      sesion.datos = {}; sesion.paso = "menu";
+      await saveSession(from, sesion);
+
+      await sendButtons(from, { body:"¿Deseas hacer algo más?", buttons:[
+        { id:"menu_cita", title:"📅 Nueva cita" }, { id:"menu_principal", title:"🏠 Menú principal" }
+      ]});
+
+    } else if (payload === "sede_cita_centro" || payload === "sede_cita_norte" || payload === "sede_cita_sur") {
+      // Usuario quiere ver otra sede
+      const sedeMap = { sede_cita_centro:"Sede Centro", sede_cita_norte:"Sede Norte", sede_cita_sur:"Sede Sur" };
+      sesion.datos.sedeCita = sedeMap[payload];
+      await saveSession(from, sesion);
+      await enviarSlotsFechas(from, sesion.datos.sedeCita, sesion.datos.especialidad);
     } else {
-      response = `Por favor selecciona una fecha válida (1 al 4) o escribe *menu* para volver.`;
+      await sendText(from,"Por favor selecciona un horario de la lista 👆");
+      await enviarSlotsFechas(from, sesion.datos.sedeCita, sesion.datos.especialidad);
     }
-
-    await sendMessage(from, response);
     return;
   }
 
-  /* ── FLUJO: SEDES ── */
+  /* ── Sedes ── */
   if (sesion.paso === "sedes") {
-    const infoSedes = {
-      "1": `🏢 *Sede Centro*\n\n📌 Dirección: Calle 10 #5-32, Piso 2\n📞 Teléfono: (604) 321-0000\n🕐 Horario: Lunes a viernes 7:00 AM – 6:00 PM | Sábados 8:00 AM – 1:00 PM\n🗺️ Frente al Parque Principal, edificio azul.`,
-      "2": `🏢 *Sede Norte*\n\n📌 Dirección: Carrera 45 #80-15\n📞 Teléfono: (604) 321-0001\n🕐 Horario: Lunes a viernes 7:00 AM – 5:00 PM | Sábados 8:00 AM – 12:00 PM\n🗺️ Barrio Santa Lucía, junto al Centro Comercial Norte.`,
-      "3": `🏢 *Sede Sur*\n\n📌 Dirección: Avenida 30 #12-40\n📞 Teléfono: (604) 321-0002\n🕐 Horario: Lunes a viernes 8:00 AM – 6:00 PM | Sábados 9:00 AM – 1:00 PM\n🗺️ Diagonal al Hospital del Sur, entrada principal.`
+    const sedes = {
+      sede_centro:{ nombre:"Sede Centro", dir:"Calle 10 #5-32, Piso 2",  tel:"(604) 321-0000", hora:"Lun–Vie 7–6 | Sáb 8–1",  ref:"Frente al Parque Principal." },
+      sede_norte: { nombre:"Sede Norte",  dir:"Carrera 45 #80-15",       tel:"(604) 321-0001", hora:"Lun–Vie 7–5 | Sáb 8–12", ref:"Junto al Centro Comercial Norte." },
+      sede_sur:   { nombre:"Sede Sur",    dir:"Avenida 30 #12-40",       tel:"(604) 321-0002", hora:"Lun–Vie 8–6 | Sáb 9–1",  ref:"Diagonal al Hospital del Sur." }
     };
-
-    if (infoSedes[msg]) {
-      response = `${infoSedes[msg]}
-
-¿Deseas hacer algo más?
-1️⃣ Ver otra sede
-2️⃣ Agendar una cita en esta sede
-🔙 Escribe *menu* para volver al inicio`;
-
-      if (msg === "2") sesion.paso = "cita_especialidad";
-
+    if (sedes[payload]) {
+      const s = sedes[payload];
+      await saveSession(from, sesion);
+      await sendText(from,`🏢 *${s.nombre}*\n\n📌 ${s.dir}\n📞 ${s.tel}\n🕐 ${s.hora}\n🗺️ ${s.ref}`);
+      await sendButtons(from,{ body:"¿Qué deseas hacer?", buttons:[
+        { id:"menu_cita", title:"📅 Agendar cita" }, { id:"menu_sedes", title:"📍 Ver otra sede" }, { id:"menu_principal", title:"🏠 Menú principal" }
+      ]});
+    } else if (payload === "menu_sedes") {
+      await saveSession(from, sesion); await enviarMenuSedes(from);
     } else {
-      response = `Por favor selecciona una sede válida (1 al 3) o escribe *menu* para volver.`;
+      await saveSession(from, sesion); await sendText(from,"Por favor selecciona una sede 👆"); await enviarMenuSedes(from);
     }
-
-    await sendMessage(from, response);
     return;
   }
 
-  /* ── FLUJO: ASESOR ── */
+  /* ── Asesor motivo ── */
   if (sesion.paso === "asesor_motivo") {
-    if (text.trim().length >= 3) {
-      sesion.datos.motivo = text.trim();
-      sesion.paso = "asesor_espera";
-      response = `✅ Hemos recibido tu mensaje.
-⏳ Tiempo estimado de espera: *3 a 5 minutos*
-
-Un asesor de *IPS Salud Vida* te atenderá en breve. 😊
-Por favor mantén este chat abierto.
-
-¿Deseas hacer algo mientras esperas?
-1️⃣ Ver horarios
-2️⃣ Ver sedes`;
+    if (text && text.trim().length >= 3) {
+      const motivo = text.trim();
+      const nombre = await redis.hget(`usuario:${from}`,"nombre") || from;
+      await sendText(from,`⏳ *Conectando con un asesor...*\nPor favor espera. 🔄`);
+      const resultado = await notificarAsesores(from, nombre, motivo);
+      if (resultado.asignado) {
+        await sendText(from,`✅ *¡Asesor conectado!*\n\n👨‍💼 *${resultado.asesor.nombre}* te atenderá ahora.\nEscribe tu consulta. 💬`);
+      } else {
+        await sendText(from,`⏳ *Todos ocupados.*\nEstás en posición *#${resultado.posicion}*.\nTe notificamos cuando haya un asesor. 🔔`);
+      }
+      sesion.paso = "con_asesor"; sesion.datos.motivo = motivo;
+      await saveSession(from, sesion);
     } else {
-      response = `Por favor cuéntanos el motivo de tu consulta para poder ayudarte mejor.`;
+      await saveSession(from, sesion); await sendText(from,"Por favor cuéntanos el motivo. ✍️");
     }
-
-    await sendMessage(from, response);
     return;
   }
 
-  if (sesion.paso === "asesor_espera") {
-    if (msg === "1") {
-      response = `🕐 *Horarios de atención por sede:*
-
-🏢 *Sede Centro*
-Lunes a viernes: 7:00 AM – 6:00 PM | Sábados: 8:00 AM – 1:00 PM
-
-🏢 *Sede Norte*
-Lunes a viernes: 7:00 AM – 5:00 PM | Sábados: 8:00 AM – 12:00 PM
-
-🏢 *Sede Sur*
-Lunes a viernes: 8:00 AM – 6:00 PM | Sábados: 9:00 AM – 1:00 PM
-
-🔙 Escribe *menu* para volver al inicio`;
-
-    } else if (msg === "2") {
-      sesion.paso = "sedes";
-      response = `📍 *Nuestras sedes disponibles:*
-
-1️⃣ Sede Centro
-2️⃣ Sede Norte
-3️⃣ Sede Sur
-🔙 Escribe *menu* para volver`;
-
-    } else {
-      response = `⏳ Sigue en espera, un asesor te atenderá pronto.
-Escribe *menu* si deseas volver al inicio.`;
-    }
-
-    await sendMessage(from, response);
-    return;
-  }
-
-  /* ── FALLBACK GLOBAL ── */
-  sesiones[from] = { paso: "menu", datos: {} };
-  response = `😅 No entendí tu mensaje.
-Escribe *menu* para ver las opciones disponibles o selecciona una opción:
-
-${menuPrincipal()}`;
-
-  await sendMessage(from, response);
+  /* ── Fallback ── */
+  await clearSession(from);
+  await saveSession(from,{ paso:"menu", datos:{} });
+  await sendText(from,"😅 No entendí tu mensaje. Te mostramos el menú principal:");
+  await enviarMenuPrincipal(from);
 }
 
-module.exports = handleBot;
+module.exports = { handleBot, sendText, sendButtons, enviarMenuPrincipal, saveSession, redis };
