@@ -14,7 +14,7 @@ const { redis } = require("./bot");
        (WhatsApp → API Setup → sección "To")
    ====================================================== */
 const ASESORES = {
-  "573153730300": { nombre: "Luis Garcia", disponible: true }  // ← Cambia por número real
+  "573045737691": { nombre: "Luis Garcia", disponible: true }  // ← Cambia por número real
 };
 /* ======================================================
    FIN ZONA DE CONFIGURACIÓN — no edites debajo de aquí
