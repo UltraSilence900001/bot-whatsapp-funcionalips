@@ -4,3 +4,7 @@ healthcheckPath = "/"
 healthcheckTimeout = 300
 restartPolicyType = "on_failure"
 
+[build]
+builder = "nixpacks"
+
+PORT = 8080
